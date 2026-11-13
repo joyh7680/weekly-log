@@ -1,0 +1,9 @@
+export type Profile = { gitName: string; gitEmail: string; notionUserId: string; notionViewId?: string }
+export type User = { id: string; name: string; email: string; role: 'admin' | 'member'; profile: Profile; createdAt: string }
+export type Project = { id: string; name: string; source: 'local' | 'bitbucket'; branch: string; localPath: string; pathFilter: string; workspace: string; repo: string; parentLabel: string; dataSourceId: string; parentId: string; viewId: string; hierarchyViewId: string; team: string; properties: Record<string, string> }
+export type Task = { id: string; title: string; description: string; start: string; end: string; commitIds: string[] }
+export type Commit = { hash: string; name: string; email: string; date: string; message: string; files: string[] }
+export type Analysis = { id: string; projectId: string; start: string; end: string; commits: Commit[]; tasks: Task[]; excluded: { hash: string; reason: string }[]; engine: string; notes: string[]; totalCommits: number }
+export type History = { id: string; userId: string; userName: string; projectId: string; task: Task; state: string; notionUrl?: string; verification?: { nativeHierarchy: boolean; dates: boolean; noLinks: boolean; visibility: boolean | null; visual: boolean }; error?: string; createdAt: string }
+export type Bootstrap = { user: User; projects: Project[]; history: History[]; range: { start: string; end: string }; connections: { notion: boolean; bitbucket: boolean } }
+export type Page = 'dashboard' | 'analyze' | 'history' | 'team' | 'connections' | 'profile'
