@@ -8,7 +8,6 @@ import { AppError, weekRange, validateRange, validateTask, excludeChanges, finge
 import { localCommits, bitbucketCommits, safePath, safeRef } from './git.mjs'
 import { analyzeTasks } from './ai.mjs'
 import { createNotion, defaultProperties } from './notion.mjs'
-import { googleIdentity } from './google.mjs'
 
 const hash = value => createHash('sha256').update(value).digest('hex')
 const stamp = () => new Date().toISOString()
@@ -25,10 +24,7 @@ export const seedProject = {
   parentLabel: '1차시 · 개발 (1)', dataSourceId: '93f3188c-425b-8263-bbea-073f6063b4a1', parentId: '2a63188c-425b-828a-b8b2-8194c885c43f', viewId: '3f93188c-425b-80ed-9d64-000ce6594b10', hierarchyViewId: '', team: '04. 프론트', properties: defaultProperties,
 }
 
-export function createApp({ dataDir = resolve('data'), fetcher = fetch, collectLocal = localCommits, analyze = analyzeTasks, google = {
-  clientId: process.env.GOOGLE_CLIENT_ID || '', clientSecret: process.env.GOOGLE_CLIENT_SECRET || '',
-  origin: process.env.APP_ORIGIN || 'http://localhost:4310', allowedDomain: process.env.GOOGLE_ALLOWED_DOMAIN || '',
-} } = {}) {
+export function createApp({ dataDir = resolve('data'), fetcher = fetch, collectLocal = localCommits, analyze = analyzeTasks } = {}) {
   const store = createStore(dataDir), { db } = store
   if (!db.prepare('SELECT id FROM projects LIMIT 1').get()) db.prepare('INSERT INTO projects VALUES (?,?,?)').run(seedProject.id, JSON.stringify(seedProject), stamp())
   const app = express(), inFlight = new Set(), attempts = new Map()
@@ -60,18 +56,6 @@ export function createApp({ dataDir = resolve('data'), fetcher = fetch, collectL
     db.prepare('INSERT INTO sessions VALUES (?,?,?)').run(hash(token), id, Date.now() + 7 * 86400000)
     res.cookie('weekly_session', token, { httpOnly: true, sameSite: 'lax', secure: process.env.COOKIE_SECURE === 'true', maxAge: 7 * 86400000, path: '/' })
   }
-  const googleEnabled = !!(google.clientId && google.clientSecret)
-  const googleCookie = { httpOnly: true, sameSite: 'lax', secure: process.env.COOKIE_SECURE === 'true', path: '/api/auth/google' }
-  function addUser(name, email, password, invite, domainApproved = false) {
-    if (db.prepare('SELECT id FROM users WHERE email=?').get(email)) throw new AppError(googleEnabled ? '이미 등록된 이메일입니다. 기존 계정으로 로그인한 뒤 내 설정에서 구글 계정을 연결해 주세요.' : '이미 등록된 이메일입니다.', 409)
-    const setup = !db.prepare('SELECT id FROM users LIMIT 1').get()
-    const code = invite ? db.prepare('SELECT * FROM invites WHERE token=? AND expires>? AND used_by IS NULL').get(invite, Date.now()) : null
-    if (!setup && !code && !domainApproved) throw new AppError('유효한 팀 초대 코드가 필요합니다.', 403)
-    const id = randomUUID()
-    db.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?)').run(id, email, name, password, setup ? 'admin' : 'member', '{}', stamp())
-    if (code) db.prepare('UPDATE invites SET used_by=? WHERE token=?').run(id, code.token)
-    return id
-  }
   const required = (req, res, next) => { const user = session(req); if (!user) return res.status(401).json({ error: '로그인해 주세요.' }); req.user = publicUser(user); next() }
   const admin = (req, res, next) => req.user.role === 'admin' ? next() : res.status(403).json({ error: '관리자만 변경할 수 있습니다.' })
   function limit(req, max = 15) {
@@ -91,65 +75,20 @@ export function createApp({ dataDir = resolve('data'), fetcher = fetch, collectL
   const history = user => db.prepare(`SELECT r.*, u.name AS user_name FROM registrations r JOIN users u ON u.id=r.user_id ${user.role === 'admin' ? '' : 'WHERE r.user_id=?'} ORDER BY r.created_at DESC LIMIT 300`).all(...(user.role === 'admin' ? [] : [user.id])).map(r => ({ id: r.id, userId: r.user_id, userName: r.user_name, projectId: r.project_id, task: JSON.parse(r.task), state: r.state, notionId: r.notion_id, notionUrl: r.notion_url, verification: JSON.parse(r.verification || 'null'), error: r.error, createdAt: r.created_at }))
 
   app.get('/api/health', (_req, res) => res.json({ ok: true, version: '0.1.0' }))
-  app.get('/api/session', (req, res) => { const row = session(req); res.json({ user: row ? publicUser(row) : null, setupRequired: !db.prepare('SELECT id FROM users LIMIT 1').get(), googleEnabled, googleDomain: google.allowedDomain || '', range: weekRange() }) })
-  app.get('/api/auth/google', (req, res) => {
-    limit(req)
-    if (!googleEnabled) throw new AppError('구글 로그인 설정이 필요합니다.', 503)
-    const invite = z.string().max(100).parse(req.query.invite || '')
-    const user = session(req)
-    const state = randomBytes(32).toString('hex'), verifier = randomBytes(32).toString('base64url')
-    db.prepare('DELETE FROM google_login_states WHERE expires<=?').run(Date.now())
-    db.prepare('INSERT INTO google_login_states VALUES (?,?,?,?,?)').run(hash(state), verifier, invite ? hash(invite) : '', user?.id || null, Date.now() + 10 * 60000)
-    res.cookie('weekly_google_state', state, { ...googleCookie, maxAge: 10 * 60000 })
-    const params = new URLSearchParams({ client_id: google.clientId, redirect_uri: `${google.origin}/api/auth/google/callback`, response_type: 'code', scope: 'openid email profile', state, code_challenge: createHash('sha256').update(verifier).digest('base64url'), code_challenge_method: 'S256', prompt: 'select_account' })
-    if (google.allowedDomain) params.set('hd', google.allowedDomain)
-    res.redirect(`https://accounts.google.com/o/oauth2/v2/auth?${params}`)
-  })
-  app.get('/api/auth/google/callback', async (req, res) => {
-    try {
-      limit(req)
-      if (!googleEnabled) throw new AppError('구글 로그인 설정이 필요합니다.', 503)
-      const state = z.string().regex(/^[a-f0-9]{64}$/).safeParse(req.query.state)
-      const cookie = req.headers.cookie?.split(';').map(s => s.trim()).find(s => s.startsWith('weekly_google_state='))?.slice(20)
-      if (!state.success || cookie !== state.data) throw new AppError('로그인 요청이 만료되었거나 올바르지 않습니다. 다시 시작해 주세요.', 400)
-      res.clearCookie('weekly_google_state', googleCookie)
-      const pending = db.prepare('DELETE FROM google_login_states WHERE token=? RETURNING *').get(hash(state.data))
-      if (!pending || pending.expires <= Date.now()) throw new AppError('로그인 요청이 만료되었습니다. 다시 시작해 주세요.', 400)
-      if (req.query.error) throw new AppError('구글 로그인을 취소했습니다.', 400)
-      const code = z.string().min(1).max(4096).parse(req.query.code)
-      const identity = await googleIdentity(code, pending.verifier, google, fetcher)
-      if (google.allowedDomain && identity.hd?.toLowerCase() !== google.allowedDomain.toLowerCase()) throw new AppError('허용된 회사 구글 계정으로 로그인해 주세요.', 403)
-      let id
-      db.exec('BEGIN IMMEDIATE')
-      try {
-        const linked = db.prepare('SELECT user_id FROM google_accounts WHERE subject=?').get(identity.sub)
-        if (pending.user_id) {
-          const user = session(req)
-          if (!user || user.id !== pending.user_id) throw new AppError('기존 계정에 다시 로그인한 뒤 구글 계정을 연결해 주세요.', 401)
-          if (user.email !== identity.email || (linked && linked.user_id !== user.id)) throw new AppError('기존 계정과 이메일이 같은 구글 계정을 선택해 주세요.', 403)
-          const previous = db.prepare('SELECT subject FROM google_accounts WHERE user_id=?').get(user.id)
-          if (previous && previous.subject !== identity.sub) throw new AppError('이 계정에는 다른 구글 계정이 연결되어 있습니다.', 409)
-          id = user.id
-        } else {
-          id = linked?.user_id || addUser((identity.name?.trim() || identity.email.split('@')[0]).slice(0, 40), identity.email, '', pending.invite, !!google.allowedDomain)
-        }
-        if (!linked) db.prepare('INSERT INTO google_accounts VALUES (?,?)').run(identity.sub, id)
-        db.exec('COMMIT')
-      } catch (error) { db.exec('ROLLBACK'); throw error }
-      signIn(res, id)
-      res.redirect(`${google.origin}/`)
-    } catch (error) {
-      const message = error instanceof AppError ? error.message : '구글 로그인에 실패했습니다. 잠시 후 다시 시도해 주세요.'
-      res.redirect(`${google.origin}/?${new URLSearchParams({ authError: message })}`)
-    }
-  })
+  app.get('/api/session', (req, res) => { const row = session(req); res.json({ user: row ? publicUser(row) : null, setupRequired: !db.prepare('SELECT id FROM users LIMIT 1').get(), range: weekRange() }) })
   app.post('/api/register', (req, res) => {
     limit(req)
-    const input = userSchema.parse(req.body), password = hashPassword(input.password)
-    let id
+    const input = userSchema.parse(req.body), setup = !db.prepare('SELECT id FROM users LIMIT 1').get()
+    const code = input.invite ? db.prepare('SELECT * FROM invites WHERE token=? AND expires>? AND used_by IS NULL').get(hash(input.invite), Date.now()) : null
+    if (!setup && !code) throw new AppError('유효한 팀 초대 코드가 필요합니다.', 403)
+    if (db.prepare('SELECT id FROM users WHERE email=?').get(input.email)) throw new AppError('이미 등록된 이메일입니다.', 409)
+    const id = randomUUID()
     db.exec('BEGIN IMMEDIATE')
     try {
-      id = addUser(input.name, input.email, password, input.invite ? hash(input.invite) : '')
+      // Recheck in the transaction so concurrent bootstrap requests cannot create two admins.
+      if (setup && db.prepare('SELECT id FROM users LIMIT 1').get()) throw new AppError('초기 설정이 완료되었습니다. 초대 코드로 가입해 주세요.', 409)
+      db.prepare('INSERT INTO users VALUES (?,?,?,?,?,?,?)').run(id, input.email, input.name, hashPassword(input.password), setup ? 'admin' : 'member', '{}', stamp())
+      if (code) db.prepare('UPDATE invites SET used_by=? WHERE token=?').run(id, code.token)
       db.exec('COMMIT')
     } catch (e) { db.exec('ROLLBACK'); throw e }
     signIn(res, id); res.status(201).json({ user: publicUser(db.prepare('SELECT * FROM users WHERE id=?').get(id)) })

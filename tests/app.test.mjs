@@ -63,6 +63,8 @@ async function harness(options = {}) {
 test('team authentication, single-use invitations, and admin-only project/token access', async () => {
   const h = await harness()
   try {
+    assert.equal((await h.call('/auth/google')).status, 404)
+    assert.equal((await h.call('/auth/google/callback')).status, 404)
     assert.equal((await h.call('/bootstrap')).status, 401)
     const owner = await h.call('/register', 'POST', { name: '관리자', email: 'owner@example.com', password: 'owner-password123' })
     assert.equal(owner.data.user.role, 'admin'); assert.match(owner.cookie, /HttpOnly/); assert.match(owner.cookie, /SameSite=Lax/)
@@ -71,6 +73,11 @@ test('team authentication, single-use invitations, and admin-only project/token 
     assert.equal((await h.call('/register', 'POST', { name: '팀원', email: 'member@example.com', password: 'member-password123' })).status, 403)
     const member = await h.call('/register', 'POST', { name: '팀원', email: 'member@example.com', password: 'member-password123', invite: invite.data.code })
     assert.equal(member.data.user.role, 'member')
+    assert.equal((await h.call('/logout', 'POST', {})).status, 200)
+    assert.equal((await h.call('/bootstrap')).status, 401)
+    const login = await h.call('/login', 'POST', { email: 'member@example.com', password: 'member-password123' })
+    assert.equal(login.status, 200)
+    assert.equal(login.data.user.id, member.data.user.id)
     assert.equal((await h.call('/connections', 'PUT', { notion: 'stolen' })).status, 403)
     assert.equal((await h.call('/projects/' + seedProject.id, 'PUT', seedProject)).status, 403)
     assert.equal((await h.call('/bootstrap')).data.projects[0].localPath, '')
